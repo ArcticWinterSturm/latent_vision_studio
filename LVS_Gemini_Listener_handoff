@@ -1,0 +1,478 @@
+
+
+# Handoff Document: Gemini Web UI Session Logger — Chrome Extension
+
+## Project Codename: LVS_Gemini
+
+---
+
+## 1. Project Purpose
+
+A Chrome Manifest V3 extension that **passively captures** Gemini web app interactions where **both** an image input **and** a text prompt are present. No automation — all input remains manual. The extension intercepts network traffic, extracts structured data, and persists it to a local SQLite3 database with associated image files on disk.
+
+---
+
+## 2. Trigger Condition
+
+The extension **only fires** when a Gemini interaction contains:
+
+- ✅ At least one uploaded image **AND** text prompt
+- ❌ Text-only prompts → ignored
+- ❌ Image-only without text → ignored
+
+---
+
+## 3. Target Environment
+
+| Parameter | Value |
+|---|---|
+| Browser | Chrome (Chromium 147+), Windows |
+| Extension Manifest | V3 |
+| Target Site | `gemini.google.com/app/*` |
+| SQLite Engine | sql.js (SQLite compiled to WebAssembly) |
+| Storage Location | `Desktop/LVS_Gemini/` |
+| DB File | `Desktop/LVS_Gemini/gemini_logs.db` |
+| Input Thumbnails | `Desktop/LVS_Gemini/input/` |
+| Output Previews | `Desktop/LVS_Gemini/output/` |
+
+---
+
+## 4. Database Schema
+
+```sql
+CREATE TABLE IF NOT EXISTS gemini_logs (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp             TEXT NOT NULL,
+    thinking_mode         INTEGER NOT NULL DEFAULT 0,  -- 1=thinking fired, 0=standard
+    thinking_text         TEXT,                         -- full CoT text if thinking=1, NULL if 0
+    prompt_text           TEXT NOT NULL,                -- user's text prompt
+    input_image_filename  TEXT,                         -- original filename e.g. "DSC_0428.jpg"
+    input_preview_path    TEXT,                         -- relative: input/{id}_128px.png
+    output_candidate_count INTEGER DEFAULT 0,           -- number of output images returned
+    output_preview_paths  TEXT,                         -- JSON array: ["output/{id}_0.png", ...]
+    output_fullsize_saved INTEGER DEFAULT 0,            -- 0=not saved (failed gen), 1=manually saved
+    response_text         TEXT,                         -- model text response, NULL for pure image gen
+    image_gen_id          TEXT,                         -- hex ID e.g. "e051ce1aa80aa576"
+    conversation_id       TEXT,                         -- e.g. "c_109e00563eac533e"
+    response_id           TEXT,                         -- e.g. "r_67d33de905ac70d7"
+    candidate_id          TEXT,                         -- e.g. "rc_5c93b88e55a41b35"
+    model_label           TEXT,                         -- e.g. "Nano Banana 2" (from stream)
+    created_at            TEXT DEFAULT (datetime('now'))
+);
+```
+
+**Key design decisions:**
+
+- **`thinking_mode`** is binary. There is **no distinction between Flash Thinking and Pro Thinking** — both produce CoT in the same wire format. The flag is purely: did CoT appear or not.
+- **`output_fullsize_saved`** defaults to `0`. When a user manually saves a full-size image and reconciles it, this flips to `1` and the preview in `output/` is deleted. Users don't save failed generations — **`0` is the failure flag**.
+- **`thinking_text`** stores the complete concatenated CoT including section headers.
+- **`response_text`** is `NULL` for pure image generation (no text output from model).
+
+---
+
+## 5. Network Protocol — Complete Wire Format
+
+### 5.1 The Single Streaming Endpoint
+
+**Everything flows through one POST request:**
+
+```
+POST https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate
+```
+
+**Query parameters:**
+
+| Param | Example | Notes |
+|---|---|---|
+| `bl` | `boq_assistant-bard-web-server_20260408.07_p0` | Build label, changes with deployments |
+| `f.sid` | `-293394717459457665` | Session ID, stable per browser session |
+| `hl` | `en` | Language |
+| `_reqid` | `8967491` | Incrementing request ID |
+| `rt` | `c` | Response type flag |
+
+**Request headers of note:**
+
+| Header | Value/Purpose |
+|---|---|
+| `content-type` | `application/x-www-form-urlencoded;charset=UTF-8` |
+| `x-goog-ext-525001261-jspb` | Contains the **image generation ID** as a JSPB array: `[1,null,null,null,"e051ce1aa80aa576",null,null,0,,null,null,2]` |
+| `x-same-domain` | `1` |
+
+**Response headers:**
+
+| Header | Value |
+|---|---|
+| `content-type` | `application/json; charset=utf-8` |
+| `content-disposition` | `attachment; filename="response.bin"` |
+| `content-encoding` | `gzip` |
+
+### 5.2 Response Wire Format — Chunked Length-Prefixed JSON
+
+The response body is **NOT** standard JSON and **NOT** Server-Sent Events. It is a proprietary **length-prefixed chunked format**:
+
+```
+)]}'
+
+{byte_count}
+{JSON_array}
+{byte_count}
+{JSON_array}
+...
+```
+
+- Starts with the anti-XSSI prefix `)]}'\n\n`
+- Each chunk: a **decimal byte count** on its own line, followed by a JSON array on the next line(s)
+- All chunks are wrapped in `[["wrb.fr", ...]]` envelope
+
+### 5.3 Stream Chunk Sequence — Thinking Mode (Image Generation)
+
+The chunks arrive in this **exact order**:
+
+---
+
+**Chunk 1 — Session initialization:**
+```json
+[["wrb.fr",null,"[null,[null,\"r_67d33de905ac70d7\"],{\"18\":\"r_67d33de905ac70d7\",\"21\":[\"GkM-427RUtQN...\"],\"44\":false}]"]]
+```
+- `r_67d33de905ac70d7` = **response ID**
+- Key `"18"` = response ID assignment
+- Key `"44"` = false throughout (unknown flag)
+
+---
+
+**Chunks 2–4 — "Creating your image..." status (repeated):**
+```json
+[["wrb.fr",null,"[null,[\"c_109e00563eac533e\",\"r_67d33de905ac70d7\"],{\"7\":[null,[\"data_analysis_tool\",[null,null,\"Creating your image...\"],1,[null,[null,null,null,null,null,null,null,],false]],null,null,null,null,null,null,null,null,null,[]],\"44\":false}]"]]
+```
+- `c_109e00563eac533e` = **conversation ID**
+- Key `"7"` contains tool invocation: `"data_analysis_tool"` with message `"Creating your image..."`
+- The `1` or `4` after the message is a **status code** (alternates — likely progress state)
+- `` = image generation tool type identifier
+
+---
+
+**Chunk 5 — Thinking header update (CoT indicator in stream):**
+```json
+[["wrb.fr",null,"[null,[\"c_109e00563eac533e\",\"r_67d33de905ac70d7\"],{\"7\":[null,null,null,null,null,[\"Constructing the Image\"],null,null,null,[\"Show Thinking (Nano Banana 2)\",\"Hide Thinking (Nano Banana 2)\"],null,[]],\"44\":false}]"]]
+```
+- Key `"7"`, index `` = **current thinking step title** (e.g., `"Constructing the Image"`)
+- Key `"7"`, index `` = **UI toggle labels**: `["Show Thinking (Nano Banana 2)","Hide Thinking (Nano Banana 2)"]`
+- **`"Nano Banana 2"` is the model label** — extract this
+- **This chunk only appears when thinking mode is active** — its presence = `thinking_mode = 1`
+
+---
+
+**Chunk 6 — The massive payload (~13KB+):**
+
+This is the main response chunk. Its inner JSON (after unescaping the string value in `wrb.fr`) contains **everything**:
+
+#### 6a. Input Image Reference
+Located in the nested array under key `"46"` within the candidate metadata:
+
+```json
+[null, 1, "0b62bc10fa6e61a6_DSC_0428.jpg",
+ "https://lh3.googleusercontent.com/gg/AMW1TPqQcPcH...",
+ null, "$AQ34dajZit304BQs...",
+ null, null, 1,
+ [1775897905, 247072000],
+ null, "image/jpeg",
+ null, null, null,
+ [1024, 682, 196182]]
+```
+
+| Index | Value | Meaning |
+|---|---|---|
+| `` | `"0b62bc10fa6e61a6_DSC_0428.jpg"` | **Original filename** (prefixed with upload hash) |
+| `` | `"https://lh3.googleusercontent.com/gg/..."` | **Google-hosted URL** of uploaded input image |
+| `` | `[1775897905, 247072000]` | **Timestamp** (seconds, nanoseconds) |
+| `` | `"image/jpeg"` | **MIME type** |
+| `` | `[1024, 682, 196182]` | **Width, Height, file size in bytes** |
+
+The original filename is extractable: strip everything before the first `_` → `DSC_0428.jpg`.
+
+#### 6b. Chain-of-Thought (Thinking Text)
+Located deep in the candidate response array. The CoT appears in **two formats** within the same chunk:
+
+**Format A — Concatenated markdown string:**
+A single escaped string containing the full CoT with `**Bold Headers**` and `\n\n` separators:
+
+```
+"**Analyzing the Image's Details**\n\nI'm currently focusing on dissecting..."
+```
+
+**Format B — Structured array of individual thought steps:**
+Each step is a separate array element with metadata:
+
+```json
+[null,[null,0,"Analyzing the Image's Details",[[0,29,[[null,null,null,null,2]]]]]]
+```
+
+| Position | Content | Notes |
+|---|---|---|
+| `` | `"Analyzing the Image's Details"` | Text content |
+| `` | `[[0,29,[[null,null,null,null,2]]]]` | Formatting metadata: `[0,29]` = bold range (chars 0–29), `2` = bold style |
+
+Steps **alternate** between headers (with bold formatting metadata) and body paragraphs (no formatting metadata):
+
+```json
+// Header step:
+[null,[null,0,"Analyzing the Image's Details",[[0,29,[[null,null,null,null,2]]]]]]
+// Body step:
+[null,[null,0,"I'm currently focusing on dissecting the original image..."]]
+// Header step:
+[null,[null,0,"Mapping Contrast and Elements",[[0,29,[[null,null,null,null,2]]]]]]
+// Body step:
+[null,[null,0,"I'm now zeroing in on deconstructing..."]]
+```
+
+**Thinking detection rule:** If the structured thought array exists and contains entries → `thinking_mode = 1`. The **concatenated markdown string** (Format A) is what to store in `thinking_text`.
+
+The CoT is wrapped inside a tool response structure:
+```
+[[[""],""," file_content_fetcher_tool","",[]],
+ [["**Analyzing..."],  // Format A
+  "","","",
+  [[[step1],[step2],...]]  // Format B
+ ]]
+```
+
+The tool name `"file_content_fetcher_tool"` wraps the thinking output.
+
+#### 6c. Output Images
+Located in a nested structure under what appears to be image generation results:
+
+```json
+[null,null,null,
+  [null,1,"732743932528795549.png",
+   "https://lh3.googleusercontent.com/gg-dl/AOI_d_8DlqWZ7N...",
+   null,"$AQ34dahSD2yRv24FL...",
+   null,null,2,
+   [1775897939,168101940],
+   null,"image/png",
+   null,null,null,
+   [1264,842,1201186]],
+  null,null,
+  [null,1,"6061769919743100983.jpeg",
+   "https://lh3.googleusercontent.com/gg-dl/AOI_d_8vei4YtNg...",
+   null,"$AQ34dai1D+XeojxK8...",
+   null,null,2,
+   [1775897939,167971320],
+   null,"image/jpeg",
+   null,null,null,
+   [1264,842,493090]]
+]
+```
+
+| Field | Image 1 (PNG) | Image 2 (JPEG) |
+|---|---|---|
+| Filename | `732743932528795549.png` | `6061769919743100983.jpeg` |
+| URL prefix | `AOI_d_` (via `gg-dl/`) | `AOI_d_` (via `gg-dl/`) |
+| Dimensions | `1264 × 842` | `1264 × 842` |
+| File size | `1,201,186` bytes (~1.2MB) | `493,090` bytes (~493KB) |
+| MIME | `image/png` | `image/jpeg` |
+
+The **PNG is the full-quality output**. The **JPEG is the compressed preview/alternate**. Output image URLs follow this pattern and are later fetched as separate network requests (`AOI_d_*=s1024-rj?alr=yes`).
+
+The `=s1024` suffix controls served resolution. Replace with `=s128` for 128px thumbnail.
+
+#### 6d. Synthetic Prompt (What Gemini Actually Sent to Imagen)
+A fully expanded English prompt is embedded:
+
+```
+"A high-resolution, precise digital Photoshop contrast-adjustment mask based on
+<IMAGE_0>. The image is rendered as a pixel-perfect mask with a pure black background
+representing neutral (no contrast change). Elements to have increased contrast are
+rendered in pure, solid magenta (255, 0, 255). These magenta areas precisely
+correspond to: all the individual spherical shapes of the red grapes; solid shapes
+for the large, flat, geometric top surfaces of all the diced watermelon cubes..."
+```
+
+This is the **model-rewritten prompt** — the actual instruction sent to the image generation backend. Valuable to store for debugging generation quality.
+
+#### 6e. Model Label
+Found in two places:
+- The thinking toggle chunk: `"Show Thinking (Nano Banana 2)"`
+- The final payload: `"Nano Banana 2"` as a standalone string near the end
+
+#### 6f. Safety Classifier Results
+An array of classifier names and results is embedded (useful for understanding rejections):
+
+```json
+["gempix2_thinking_mode_input_regex",[null,[true]]]
+["public_entity_ungrounded_sup_classifier",[...]]
+["text_safety_classifier",[...]]
+["image_and_video_safety_classifier",[...]]
+["gempix_reactive_safety_classifier",[...]]
+["input_prompt_regex",[...]]
+["output_prompt_regex",[...]]
+```
+
+The key `"gempix2_thinking_mode_input_regex"` with value `[null,[true]]` is another **binary thinking-mode indicator**.
+
+#### 6g. Image Content Labels
+An array of classification labels with confidence scores from the output image:
+
+```json
+[["Human action","/m/07p82rh",0.93911326],
+ ["Photograph","/m/068jd",0.9340232],
+ ["Grapes","/m/0d_4s",0.6604252],
+ ["Fruit","/m/02xwb",0.3510264], ...]
+```
+
+---
+
+**Chunk 7 — Prompt echo:**
+```json
+[["wrb.fr",null,"[null,[\"c_109e00563eac533e\",\"r_67d33de905ac70d7\"],{\"11\":[\"Turn this into a photoshop mask, pure magenta where the contrast is increased and pure green where the contrast is decreased. +contrast melon edges, flats of watermelon, strawberry seeds, grapes. -contrast strawberry greens, serving plate.\"],\"44\":false}]"]]
+```
+- Key `"11"` = **the original user prompt text as an array with one string element**
+- This is the clean, unmodified prompt exactly as typed
+
+---
+
+**Chunk 8 — Session token:**
+```json
+[["wrb.fr",null,"[null,[\"c_109e00563eac533e\",\"r_67d33de905ac70d7\"],{\"26\":\"AwAAAAAAAAAg4DUFz3Xz2P6f8UG81xlM72BiXKdQZhMAAAA\",\"44\":false}]"]]
+```
+- Key `"26"` = session continuation token (base64)
+
+---
+
+**Chunk 9 — Termination:**
+```json
+[["di",38706],["af.httprm",38705,"-6436033568662573789",42]]
+```
+```json
+[["e",19,null,null,157032]]
+```
+- `"di"` = final byte offset
+- `"af.httprm"` = HTTP request metadata cleanup
+- `"e"` = end signal, `157032` = total response size in bytes
+
+---
+
+### 5.4 Stream Chunk Sequence — Non-Thinking Mode
+
+The same endpoint, same format, but **shorter**:
+
+1. Session initialization chunk (same)
+2. `"Creating your image..."` status chunks (same)
+3. **NO thinking header chunk** (the chunk with `"Show Thinking..."` is **absent**)
+4. Main payload chunk — **same structure but no CoT arrays/strings, no `file_content_fetcher_tool` wrapping**
+5. Prompt echo chunk (same)
+6. Session token chunk (same)
+7. Termination chunks (same)
+
+**Thinking detection** is therefore reliable by checking for:
+- Presence of chunk containing `"Show Thinking"` in key `"7"` index ``
+- OR presence of `"file_content_fetcher_tool"` in the main payload
+- OR `"gempix2_thinking_mode_input_regex"` with `[null,[true]]`
+
+---
+
+### 5.5 Parallel Batchexecute RPCs
+
+These fire **alongside** the StreamGenerate request and are **secondary signals**:
+
+| RPC ID | Fires in Non-Thinking | Fires in Thinking | Purpose |
+|---|---|---|---|
+| `PCck7e` | ❌ Never | ✅ Once, first | Thinking mode session setup. Returns empty `"[]"` response. |
+| `qpEbW` | ✅ Once | ✅ Once | Prompt submission acknowledgment |
+| `aPya6c` | ✅ 1 call, fast | ✅ 4–5 calls, last one slow (2+ sec) | Generation polling / status check |
+| `ESY5D` | ✅ 1 call, ~287ms | ✅ 2 calls, first one **3.63s** | Activity state — long duration = thinking |
+
+**For extension purposes:** The StreamGenerate response is the **single source of truth**. The batchexecute RPCs are confirmation signals only. `PCck7e` presence is a useful secondary thinking-mode indicator but the stream itself is definitive.
+
+---
+
+## 6. Output Image Fetch Pattern
+
+After the StreamGenerate response completes, the browser fetches output images separately:
+
+```
+GET https://lh3.googleusercontent.com/gg-dl/AOI_d_{hash}=s1024-rj?alr=yes
+```
+
+| Size Category | Meaning |
+|---|---|
+| **~1.1 kB** | Metadata probe / placeholder |
+| **~87 kB** | Actual preview-resolution rendered image |
+
+Multiple candidates are fetched (observed: **8 image fetches** for a single generation, representing multiple candidates with both probe + actual for each).
+
+The `=s1024-rj` suffix controls resolution:
+- `s1024` = fit within 1024px
+- `s128` = fit within 128px (for thumbnail generation)
+- `rj` = JPEG recompression flag
+
+---
+
+## 7. Input Image Upload Protocol
+
+Uploaded before the StreamGenerate call via Google's resumable upload:
+
+```
+POST https://push.clients6.google.com/upload/
+```
+
+| Header | Purpose |
+|---|---|
+| `x-goog-upload-command` | `start` → `upload` → `finalize` (three-phase) |
+| `x-tenant-id` | `bard-storage` |
+
+Returns an `upload_id` which is referenced in the StreamGenerate request. The uploaded image is then accessible via `lh3.googleusercontent.com/gg/` URLs (note: `/gg/` not `/gg-dl/` — input images use `/gg/`, output images use `/gg-dl/`).
+
+---
+
+## 8. Data Extraction Map — What to Intercept
+
+| Data Point | Source | Key/Location |
+|---|---|---|
+| **Prompt text** | StreamGenerate chunk with key `"11"` | `"11":["{text}"]` |
+| **Thinking mode flag** | Presence of chunk with `"Show Thinking"` | Key `"7"`, index `` |
+| **Thinking text** | Main payload chunk, Format A string | Inside `file_content_fetcher_tool` response |
+| **Input image filename** | Main payload chunk | `"0b62bc10fa6e61a6_DSC_0428.jpg"` — strip prefix before first `_` |
+| **Input image URL** | Main payload chunk | `lh3.googleusercontent.com/gg/...` |
+| **Input image metadata** | Main payload chunk | `[width, height, filesize]` = `[1024, 682, 196182]` |
+| **Output image URLs** | Main payload chunk + separate fetches | `lh3.googleusercontent.com/gg-dl/AOI_d_...` |
+| **Output image metadata** | Main payload chunk | `[1264, 842, 1201186]` per image |
+| **Conversation ID** | Every chunk after first | `"c_109e00563eac533e"` |
+| **Response ID** | First chunk | `"r_67d33de905ac70d7"` |
+| **Candidate ID** | Main payload chunk | `"rc_5c93b88e55a41b35"` |
+| **Model label** | Thinking toggle chunk or final payload | `"Nano Banana 2"` |
+| **Image gen ID** | Request header `x-goog-ext-525001261-jspb` and response payload | `"e051ce1aa80aa576"` |
+| **Synthetic prompt** | Main payload chunk | Long English string with `<IMAGE_0>` reference |
+| **Response text** | Main payload chunk, candidate content | First element of candidate `parts` — `[""]` for image-only |
+
+---
+
+## 9. File System Layout
+
+```
+Desktop/
+  LVS_Gemini/
+    gemini_logs.db              ← SQLite3 database
+    input/
+      {id}_128px.png            ← 128px downscaled input image
+    output/
+      {id}_0_preview.png        ← Auto-captured output preview
+      {id}_1_preview.png        ← (if multiple candidates)
+```
+
+- Input images are **always** stored as 128px thumbnails (longest edge = 128px, aspect preserved)
+- Output previews are captured at whatever resolution `AOI_d_` serves (typically ~1024px)
+- When user manually saves full-size and reconciles → preview is **deleted**, `output_fullsize_saved` flips to `1`
+- Unsaved outputs (previews still present, `output_fullsize_saved = 0`) = **failed/rejected generation**
+
+---
+
+## 10. Extension Architecture
+
+| Component | File | Responsibility |
+|---|---|---|
+| Service Worker | `background.js` | Intercepts `StreamGenerate` via `chrome.webRequest` or `chrome.debugger`, routes parsed data to offscreen |
+| Content Script | `content.js` | Minimal — only needed if DOM interaction required (e.g., fallback blob capture) |
+| Offscreen Document | `offscreen.html` + `offscreen.js` | Canvas for 128px resize, sql.js for SQLite, fetch for image downloads |
+| Popup | `popup.html` + `popup.js` | DB export button, row count, basic stats |
+
+**Critical implementation note:** The StreamGenerate response must be intercepted as a **full response body** — it is **not** an EventSource stream. It returns as a regular `application/json` POST response with the chunked length-prefix format described above. Use `chrome.debugger` with `Network.getResponseBody` or a `DeclarativeNetRequest` + response body interception pattern. The `chrome.webRequest` API in MV3 **cannot read response bodies** — this is the primary technical constraint.
